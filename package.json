@@ -1,0 +1,36 @@
+{
+  "name": "trel-data",
+  "version": "1.0.0",
+  "description": "TrEL Data",
+  "type": "module",
+  "packageManager": "pnpm@9.0.0",
+  "engines": {
+    "node": ">=18.0.0",
+    "pnpm": ">=9.0.0"
+  },
+  "scripts": {
+    "dev": "vite",
+    "dev:backend": "python app.py",
+    "dev:backend:mac": "python3 app.py",
+    "dev:all": "pnpm dlx concurrently -n \"frontend,backend\" -c \"cyan,yellow\" \"pnpm dev\" \"pnpm dev:backend\"",
+    "dev:all:mac": "pnpm dlx concurrently -n \"frontend,backend\" -c \"cyan,yellow\" \"pnpm dev\" \"pnpm dev:backend:mac\"",
+    "build": "vite build",
+    "preview": "vite preview",
+    "lint": "eslint . --ext js,jsx --report-unused-disable-directives --max-warnings 0"
+  },
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.2.43",
+    "@types/react-dom": "^18.2.17",
+    "@vitejs/plugin-react-swc": "^3.7.0",
+    "concurrently": "^8.2.2",
+    "eslint": "^8.55.0",
+    "eslint-plugin-react": "^7.33.2",
+    "eslint-plugin-react-hooks": "^4.6.0",
+    "eslint-plugin-react-refresh": "^0.4.5",
+    "vite": "^5.0.8"
+  }
+}
