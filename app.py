@@ -27,6 +27,18 @@ from utils.osc_processor import (
 )
 from utils.master_processor import process_master
 from utils.trel_common import parse_minutes_from_filename
+from utils.local_files import (
+    assert_allowed_directory,
+    output_file,
+    pick_folder,
+    read_bytes,
+    read_text,
+    remember_root,
+    safe_child,
+    scan_analysis,
+    scan_batch,
+)
+from utils.contour_export import export_contour_workbooks
 from utils.trel_analysis import (
     analyze_single_file,
     DEFAULT_TANGENT_WINDOW_POINTS,
@@ -582,29 +594,40 @@ def trel_analysis_preview():
     - low_pct, high_pct, n_decay, rise_mode, decay_fit_start_us
     """
     try:
-        f = request.files.get('file')
-        if not f or not f.filename or f.filename.startswith('._'):
-            return jsonify({'success': False, 'error': '파일이 없습니다.'}), 400
-        low_pct = float(request.form.get('low_pct', 0.1))
-        high_pct = float(request.form.get('high_pct', 99))
-        n_decay = int(request.form.get('n_decay', 2))
-        rise_mode = request.form.get('rise_mode', 'tangent')
-        decay_fit_start_us = float(request.form.get('decay_fit_start_us', 0.0))
-        decay_fit_end_raw = request.form.get('decay_fit_end_us', '').strip()
+        body = _request_body()
+        if body is not None:
+            root = assert_allowed_directory(body.get('path'))
+            file_path = safe_child(root, body.get('relPath'))
+            filename = os.path.basename(file_path)
+            content = read_text(file_path)
+        else:
+            f = request.files.get('file')
+            if not f or not f.filename or f.filename.startswith('._'):
+                return jsonify({'success': False, 'error': '파일이 없습니다.'}), 400
+            filename = f.filename
+            content = f.read().decode('utf-8', errors='replace')
+        low_pct = float(_request_value(body, 'low_pct', 0.1))
+        high_pct = float(_request_value(body, 'high_pct', 99))
+        n_decay = int(_request_value(body, 'n_decay', 2))
+        rise_mode = _request_value(body, 'rise_mode', 'tangent')
+        decay_fit_start_us = float(_request_value(body, 'decay_fit_start_us', 0.0))
+        decay_fit_end_raw = str(_request_value(body, 'decay_fit_end_us', '')).strip()
         decay_fit_end_us = float(decay_fit_end_raw) if decay_fit_end_raw else None
         tangent_window_points = parse_tangent_window_points(
-            request.form.get('tangent_window_points', DEFAULT_TANGENT_WINDOW_POINTS)
+            _request_value(body, 'tangent_window_points', DEFAULT_TANGENT_WINDOW_POINTS)
         )
-        decay_init_json = request.form.get('decay_initial_params')
+        decay_init_raw = _request_value(body, 'decay_initial_params', '')
         decay_initial_params = None
-        if decay_init_json:
+        if isinstance(decay_init_raw, list):
+            if len(decay_init_raw) >= 3:
+                decay_initial_params = [float(x) for x in decay_init_raw]
+        elif decay_init_raw:
             try:
-                parsed = json.loads(decay_init_json)
+                parsed = json.loads(decay_init_raw)
                 if isinstance(parsed, list) and len(parsed) >= 3:
                     decay_initial_params = [float(x) for x in parsed]
             except (json.JSONDecodeError, TypeError, ValueError):
                 pass
-        content = f.read().decode('utf-8', errors='replace')
         preview = get_trel_preview(
             content,
             low_pct,
@@ -618,7 +641,7 @@ def trel_analysis_preview():
         )
         if preview.get('error'):
             return jsonify({'success': False, 'error': preview['error']}), 400
-        return jsonify({'success': True, 'filename': f.filename, **preview})
+        return jsonify({'success': True, 'filename': filename, **preview})
     except Exception as e:
         print(f"[trel_analysis_preview] Error: {e}", flush=True)
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -641,19 +664,32 @@ def trel_analysis_batch():
         return jsonify({'success': False, 'error': 'openpyxl 설치 필요: pip install openpyxl'}), 500
 
     try:
-        files = request.files.getlist('files') or ([request.files.get('file')] if request.files.get('file') else [])
-        vil_files = request.files.getlist('vil_files') or []
+        body = _request_body()
+        output_dir = None
+        if body is not None:
+            output_dir = assert_allowed_directory(body.get('path'))
+            files = []
+            for rel in body.get('files') or []:
+                file_path = safe_child(output_dir, rel)
+                files.append(MemoryUpload(os.path.basename(file_path), read_bytes(file_path)))
+            vil_files = []
+            for rel in body.get('vil_files') or []:
+                file_path = safe_child(output_dir, rel)
+                vil_files.append(MemoryUpload(os.path.basename(file_path), read_bytes(file_path)))
+        else:
+            files = request.files.getlist('files') or ([request.files.get('file')] if request.files.get('file') else [])
+            vil_files = request.files.getlist('vil_files') or []
         files = [f for f in files if f and f.filename and not f.filename.startswith('._') and f.filename.lower().endswith('.csv') and ('_TrEL' in f.filename or 'TrEL' in f.filename) and 'VIL' not in f.filename.upper()]
         vil_files = [f for f in vil_files if f and f.filename and not f.filename.startswith('._') and 'VIL' in f.filename.upper() and '_processed' in f.filename]
-        low_pct = float(request.form.get('low_pct', 0.1))
-        high_pct = float(request.form.get('high_pct', 99))
-        n_decay = int(request.form.get('n_decay', 2))
-        rise_mode = request.form.get('rise_mode', 'tangent')
-        decay_fit_start_us = float(request.form.get('decay_fit_start_us', 0.0))
-        decay_fit_end_raw = request.form.get('decay_fit_end_us', '').strip()
+        low_pct = float(_request_value(body, 'low_pct', 0.1))
+        high_pct = float(_request_value(body, 'high_pct', 99))
+        n_decay = int(_request_value(body, 'n_decay', 2))
+        rise_mode = _request_value(body, 'rise_mode', 'tangent')
+        decay_fit_start_us = float(_request_value(body, 'decay_fit_start_us', 0.0))
+        decay_fit_end_raw = str(_request_value(body, 'decay_fit_end_us', '')).strip()
         decay_fit_end_us = float(decay_fit_end_raw) if decay_fit_end_raw else None
         tangent_window_points = parse_tangent_window_points(
-            request.form.get('tangent_window_points', DEFAULT_TANGENT_WINDOW_POINTS)
+            _request_value(body, 'tangent_window_points', DEFAULT_TANGENT_WINDOW_POINTS)
         )
 
         if not files:
@@ -665,11 +701,14 @@ def trel_analysis_batch():
         TREL_BATCH_PROGRESS['filename'] = ''
         TREL_BATCH_PROGRESS['stage'] = '파일 로드'
 
-        decay_init_json = request.form.get('decay_initial_params')
+        decay_init_raw = _request_value(body, 'decay_initial_params', '')
         preview_decay_popt = None
-        if decay_init_json:
+        if isinstance(decay_init_raw, list):
+            if len(decay_init_raw) >= 3:
+                preview_decay_popt = [float(x) for x in decay_init_raw]
+        elif decay_init_raw:
             try:
-                preview_decay_popt = json.loads(decay_init_json)
+                preview_decay_popt = json.loads(decay_init_raw)
                 if not isinstance(preview_decay_popt, list) or len(preview_decay_popt) < 3:
                     preview_decay_popt = None
             except (json.JSONDecodeError, TypeError):
@@ -678,8 +717,8 @@ def trel_analysis_batch():
         vil_time_voltage_lum = []
         vil_time_shift_min = 0.0
         vil_duty_fraction = 1.0
-        vil_shift_form = request.form.get('vil_time_shift_min', '').strip()
-        vil_duty_form = request.form.get('vil_duty_fraction', '').strip()
+        vil_shift_form = str(_request_value(body, 'vil_time_shift_min', '')).strip()
+        vil_duty_form = str(_request_value(body, 'vil_duty_fraction', '')).strip()
         if vil_shift_form:
             try:
                 vil_time_shift_min = float(vil_shift_form)
@@ -855,9 +894,16 @@ def trel_analysis_batch():
         rise_mode_token = rise_mode_label.replace(' ', '')
         fit_start_token = str(decay_fit_start_us).replace('.', 'p')
         output_filename = f'TrEL_Analysis_{rise_mode_token}_fitStart{fit_start_token}us.xlsx'
+        payload = output.getvalue()
+
+        if output_dir:
+            dest = os.path.join(output_dir, output_filename)
+            with open(dest, 'wb') as handle:
+                handle.write(payload)
+            return jsonify({'success': True, 'output_filename': output_filename, 'path': dest})
 
         return Response(
-            output.getvalue(),
+            payload,
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
             headers={'Content-Disposition': f'attachment; filename={output_filename}'}
         )
@@ -866,6 +912,337 @@ def trel_analysis_batch():
         return jsonify({'success': False, 'error': str(e)}), 500
     finally:
         TREL_BATCH_PROGRESS['active'] = False
+
+class MemoryUpload:
+    def __init__(self, filename, data):
+        self.filename = filename
+        self._data = data
+
+    def read(self):
+        return self._data
+
+
+def _request_body():
+    if request.is_json:
+        return request.get_json(silent=True) or {}
+    return None
+
+
+def _request_value(body, name, default=''):
+    if body is not None:
+        if name not in body or body[name] is None:
+            return default
+        return body[name]
+    value = request.form.get(name, default)
+    return default if value is None else value
+
+
+@app.route('/api/pick-folder', methods=['POST'])
+def api_pick_folder():
+    try:
+        path = pick_folder()
+        if not path:
+            print('[pick-folder] cancelled', flush=True)
+            return jsonify({'success': True, 'cancelled': True})
+        remembered = remember_root(path)
+        print(f'[pick-folder] {remembered}', flush=True)
+        return jsonify({
+            'success': True,
+            'path': remembered,
+            'name': os.path.basename(remembered.rstrip('\\/')) or remembered,
+        })
+    except Exception as e:
+        print(f'[pick-folder] Error: {e}', flush=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/scan-batch', methods=['POST'])
+def api_scan_batch():
+    try:
+        body = request.get_json(silent=True) or {}
+        root = assert_allowed_directory(body.get('path'))
+        scanned = scan_batch(root)
+        print(
+            f"[scan-batch] {root} vil={len(scanned['vilFiles'])} pairs={len(scanned['oscPairs'])} trel={len(scanned['existingTrel'])}",
+            flush=True,
+        )
+        return jsonify({'success': True, 'path': root, **scanned})
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    except Exception as e:
+        print(f'[scan-batch] Error: {e}', flush=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/scan-analysis', methods=['POST'])
+def api_scan_analysis():
+    try:
+        body = request.get_json(silent=True) or {}
+        root = assert_allowed_directory(body.get('path'))
+        scanned = scan_analysis(root)
+        print(
+            f"[scan-analysis] {root} trel={len(scanned['analysisFiles'])} vil={len(scanned['analysisVilFiles'])}",
+            flush=True,
+        )
+        return jsonify({'success': True, 'path': root, **scanned})
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    except Exception as e:
+        print(f'[scan-analysis] Error: {e}', flush=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/contour-export', methods=['POST'])
+def api_contour_export():
+    try:
+        body = request.get_json(silent=True) or {}
+        root = assert_allowed_directory(body.get('path'))
+        lum_high = float(body.get('lum_high', 100))
+        lum_low = float(body.get('lum_low', 50))
+        time_start_us = float(body.get('time_start_us', 0))
+        if lum_high < lum_low:
+            raise ValueError('휘도 상한이 하한보다 커야 합니다.')
+        result = export_contour_workbooks(
+            root,
+            lum_high=lum_high,
+            lum_low=lum_low,
+            time_start_us=time_start_us,
+        )
+        print(
+            f"[contour-export] {root} traces={result['n_traces']} files={[item['filename'] for item in result['files']]}",
+            flush=True,
+        )
+        return jsonify({'success': True, **result})
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    except Exception as e:
+        print(f'[contour-export] Error: {e}', flush=True)
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/preview-osc-path', methods=['POST'])
+def preview_osc_path():
+    try:
+        body = request.get_json(silent=True) or {}
+        root = assert_allowed_directory(body.get('path'))
+        file_path = safe_child(root, body.get('relPath'))
+        content = read_text(file_path)
+        filename = os.path.basename(file_path)
+        preview = get_lowfreq_preview_data(content)
+        if 'error' in preview:
+            return jsonify({'success': False, 'error': preview['error']}), 400
+        freq, duty = parse_frequency_duty(filename)
+        return jsonify({
+            'success': True,
+            'filename': filename,
+            'time_ns': preview['time_ns'],
+            'ch1': preview['ch1'],
+            'ch2': preview['ch2'],
+            'n_points': preview['n_points'],
+            'frequency_hz': freq,
+            'duty_fraction': duty,
+            'mode': 'lowfreq',
+        })
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    except Exception as e:
+        print(f'[preview-osc-path] Error: {e}', flush=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+def _float_or_none(value):
+    if value is None or value == '':
+        return None
+    return float(value)
+
+
+@app.route('/api/process-batch', methods=['POST'])
+def api_process_batch():
+    """선택한 로컬 폴더의 VIL, rise/decay, 마스터 파일을 디스크에 저장한다."""
+    vil_results = []
+    osc_results = []
+    try:
+        body = request.get_json(silent=True) or {}
+        root = assert_allowed_directory(body.get('path'))
+        scanned = scan_batch(root)
+
+        baseline_start = float(body.get('baseline_start_ns', 100000))
+        baseline_end = float(body.get('baseline_end_ns', 250000))
+        norm_start = str(body.get('norm_start_ns', '') or '').strip()
+        norm_end = str(body.get('norm_end_ns', '') or '').strip()
+        sat_start_ns = float(norm_start) if norm_start else -250000
+        sat_end_ns = float(norm_end) if norm_end else -50000
+        device_area_mm2 = _float_or_none(body.get('device_area_mm2'))
+        r_shunt = _float_or_none(body.get('r_shunt'))
+        r_osc = _float_or_none(body.get('r_osc'))
+
+        for entry in scanned['vilFiles']:
+            filename = entry['name']
+            rel_path = entry['relPath']
+            target = parse_target_current_from_filename(filename)
+            if target is None:
+                vil_results.append({
+                    'filename': filename,
+                    'relPath': rel_path,
+                    'success': False,
+                    'error': '파일명에서 목표 전류를 추출할 수 없습니다.',
+                })
+                continue
+            try:
+                content = read_text(safe_child(root, rel_path))
+                csv_out, _time_shift, meta = process_vil_data(
+                    content, target, filename, r_shunt, r_osc, device_area_mm2=device_area_mm2
+                )
+                xlsx_meta = {
+                    'time_shift_s': meta['time_shift_s'],
+                    'time_shift_min': meta['time_shift_min'],
+                    'duty_fraction': meta.get('duty_fraction', parse_duty_from_filename(filename) or 1.0),
+                    'filename': filename,
+                }
+                xlsx_bytes = csv_text_to_xlsx_bytes(csv_out, metadata=xlsx_meta)
+                out_name = meta.get('output_filename', filename.replace('.csv', '_processed.xlsx'))
+                dest = output_file(root, rel_path, out_name)
+                with open(dest, 'wb') as handle:
+                    handle.write(xlsx_bytes)
+                vil_results.append({
+                    'filename': filename,
+                    'relPath': rel_path,
+                    'output_filename': out_name,
+                    'success': True,
+                    'csv': csv_out,
+                    'time_shift_s': meta['time_shift_s'],
+                    'time_shift_min': meta['time_shift_min'],
+                    'target_current_ua': meta['target_current_ua'],
+                    'original_points': meta['original_points'],
+                    'filtered_points': meta['filtered_points'],
+                })
+            except Exception as e:
+                vil_results.append({
+                    'filename': filename,
+                    'relPath': rel_path,
+                    'success': False,
+                    'error': str(e),
+                })
+
+        for pair in scanned['oscPairs']:
+            rise = pair['rise']
+            decay = pair['decay']
+            key = pair['key']
+            try:
+                rise_content = read_text(safe_child(root, rise['relPath']))
+                decay_content = read_text(safe_child(root, decay['relPath']))
+                csv_out, meta = process_lowfreq_pair(
+                    rise_content,
+                    decay_content,
+                    zero_start_ns=baseline_start,
+                    zero_end_ns=baseline_end,
+                    sat_start_ns=sat_start_ns,
+                    sat_end_ns=sat_end_ns,
+                    filename_base=key,
+                    r_shunt=r_shunt,
+                    r_osc=r_osc,
+                    device_area_mm2=device_area_mm2,
+                )
+                dest = output_file(root, rise['relPath'], meta['output_filename'])
+                with open(dest, 'w', encoding='utf-8', newline='') as handle:
+                    handle.write(csv_out)
+                osc_results.append({
+                    'filename': key,
+                    'rise_filename': rise['name'],
+                    'decay_filename': decay['name'],
+                    'relPath': rise['relPath'],
+                    'output_filename': meta['output_filename'],
+                    'success': True,
+                    'csv': csv_out,
+                    'original_points': meta['original_points'],
+                    'format': 'lowfreq',
+                })
+            except Exception as e:
+                osc_results.append({
+                    'filename': key,
+                    'rise_filename': rise['name'],
+                    'decay_filename': decay['name'],
+                    'relPath': rise['relPath'],
+                    'success': False,
+                    'error': str(e),
+                })
+
+        vil_for_master = next((item for item in vil_results if item.get('success') and item.get('csv')), None)
+        master_ok = False
+        master_metadata = None
+        if vil_for_master:
+            generated = [
+                (item['output_filename'], item['csv'])
+                for item in osc_results
+                if item.get('success') and item.get('csv')
+            ]
+            if generated:
+                files_data = generated
+            else:
+                files_data = [
+                    (entry['name'], read_text(safe_child(root, entry['relPath'])))
+                    for entry in scanned['existingTrel']
+                ]
+                if not files_data:
+                    if osc_results:
+                        first_error = next((item.get('error') for item in osc_results if not item.get('success')), None)
+                        raise RuntimeError(
+                            f'TrEL 처리에 모두 실패했습니다. 첫 번째 오류: {first_error}'
+                            if first_error
+                            else 'TrEL 처리에 성공한 파일이 없습니다. TrEL_processed에 _TrEL.csv가 생성됐는지 확인해주세요.'
+                        )
+                    raise RuntimeError('마스터 파일 생성에 사용할 TrEL 파일이 없습니다. TrEL 처리 결과 또는 기존 _TrEL.csv 파일을 확인해주세요.')
+
+            master_percents_str = str(body.get('master_percents', '100,90,80,70,60,50'))
+            try:
+                master_percents = [int(part.strip()) for part in master_percents_str.split(',') if part.strip()]
+            except ValueError:
+                master_percents = [100, 90, 80, 70, 60, 50]
+            if not master_percents:
+                master_percents = [100, 90, 80, 70, 60, 50]
+
+            vil_filename = vil_for_master.get('filename') or ''
+            xlsx_bytes, _summary, master_metadata = process_master(
+                vil_for_master['csv'],
+                vil_for_master.get('time_shift_min') or 0.0,
+                files_data,
+                percent_list=master_percents,
+                target_current_ua=parse_target_current_from_filename(vil_filename) if vil_filename else None,
+                device_area_mm2=device_area_mm2,
+                r_shunt=r_shunt,
+                r_osc=r_osc,
+                vil_filename=vil_filename,
+            )
+            output_filename = master_metadata.get('output_filename', 'TrEL_Master.xlsx')
+            dest = output_file(root, '', output_filename)
+            with open(dest, 'wb') as handle:
+                handle.write(xlsx_bytes)
+            master_ok = True
+
+        public_vil = [{key: value for key, value in item.items() if key != 'csv'} for item in vil_results]
+        public_osc = [{key: value for key, value in item.items() if key != 'csv'} for item in osc_results]
+        return jsonify({
+            'success': True,
+            'vil': public_vil,
+            'osc': public_osc,
+            'master': master_ok,
+            'masterMetadata': master_metadata,
+        })
+    except Exception as e:
+        print(f'[process-batch] Error: {e}', flush=True)
+        traceback.print_exc()
+        public_vil = [{key: value for key, value in item.items() if key != 'csv'} for item in vil_results]
+        public_osc = [{key: value for key, value in item.items() if key != 'csv'} for item in osc_results]
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'vil': public_vil,
+            'osc': public_osc,
+            'master': False,
+            'masterMetadata': None,
+        }), 500
+
 
 if __name__ == '__main__':
     port_str = os.environ.get('PORT')

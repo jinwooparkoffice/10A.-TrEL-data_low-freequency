@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react'
 import './App.css'
 import AnalysisTab from './AnalysisTab'
+import ContourTab from './ContourTab'
 import { apiUrl } from './api'
-import { dedupFilesByPath, scanBatchFolder } from './fileUtils'
 
 function PreviewChart({ timeNs, ch1, baselineStart, baselineEnd, normStart, normEnd }) {
   const w = 600
@@ -271,7 +271,7 @@ function App() {
   const [rShunt, setRShunt] = useState(100.0)  // 직렬 센서 저항 (Ω)
   const [rOsc, setROsc] = useState(50.0)       // 오실로스코프 내부 저항 (Ω)
   const [deviceAreaMm2, setDeviceAreaMm2] = useState(4.3)  // 소자 유효 면적 (mm²)
-  const [activeTab, setActiveTab] = useState('batch')  // 'batch' | 'analysis'
+  const [activeTab, setActiveTab] = useState('batch')  // 'batch' | 'analysis' | 'contour'
   const batchAbortRef = useRef(null)
   
   // R_total 자동 계산
@@ -293,73 +293,73 @@ function App() {
       .catch(() => setBackendStatus({ status: 'error' }))
   }, [])
 
-  const base64ToUint8Array = (b64) => {
-    const binary = atob(b64)
-    const bytes = new Uint8Array(binary.length)
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
-    return bytes
-  }
-
-  const ensureReadWritePermission = async (dirHandle) => {
-    const options = { mode: 'readwrite' }
-    if ((await dirHandle.queryPermission(options)) === 'granted') {
-      return true
+  const readJson = async (res) => {
+    const data = await res.json().catch(() => null)
+    if (!data) {
+      throw new Error(`서버 응답을 읽을 수 없습니다. (HTTP ${res.status}) 백엔드를 다시 실행해주세요.`)
     }
-    return (await dirHandle.requestPermission(options)) === 'granted'
+    return data
   }
 
   const handleFolderSelect = async () => {
-    if (selectingFolder) return
-    if (!('showDirectoryPicker' in window)) {
-      setError('이 브라우저는 폴더 선택을 지원하지 않습니다. Chrome 또는 Edge를 사용해주세요.')
-      return
-    }
-
-    let dirHandle
-    try {
-      setSelectingFolder(true)
-      dirHandle = await window.showDirectoryPicker({ id: 'trel-batch-folder' })
-    } catch (err) {
-      setSelectingFolder(false)
-      if (err.name === 'AbortError') return
-      setError(getReadableError(err))
-      setFolderReady(false)
-      return
-    }
+    if (selectingFolder || scanningFolder) return
 
     setError(null)
-    setResults({ vil: [], osc: [], master: false, masterMetadata: null })
+    setSelectingFolder(true)
+    let rootPath = ''
     try {
+      const pickRes = await fetch(apiUrl('/api/pick-folder'), { method: 'POST' })
+      const pick = await readJson(pickRes)
+      if (!pick.success) throw new Error(pick.error || '폴더 선택에 실패했습니다.')
+      if (pick.cancelled || !pick.path) return
+
+      rootPath = pick.path
       setSelectingFolder(false)
       setScanningFolder(true)
+      setResults({ vil: [], osc: [], master: false, masterMetadata: null })
 
-      const scanned = await scanBatchFolder(dirHandle)
-      const vilFiles = dedupFilesByPath(scanned.vilFiles)
+      const scanRes = await fetch(apiUrl('/api/scan-batch'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: rootPath }),
+      })
+      const scanned = await readJson(scanRes)
+      if (!scanned.success) throw new Error(scanned.error || '폴더 스캔에 실패했습니다.')
+
+      const vilFiles = scanned.vilFiles || []
       const oscPairs = scanned.oscPairs || []
       const unpairedOsc = scanned.unpairedOsc || []
-      const existingTrel = dedupFilesByPath(scanned.existingTrel)
+      const existingTrel = scanned.existingTrel || []
       if (vilFiles.length === 0 && oscPairs.length === 0 && existingTrel.length === 0) {
         const unpairedMsg = unpairedOsc.length > 0
           ? ` 페어링 실패 파일 ${unpairedOsc.length}개: ${unpairedOsc.map(f => f.name).join(', ')}`
           : ''
         setError(`처리할 CSV 파일이 없습니다. (VIL, rise/decay 페어, 또는 _TrEL.csv)${unpairedMsg}`)
         setFolderReady(false)
+        setFolderData(null)
         return
       }
-      let previewData = null
-      if (oscPairs.length > 0) {
-        const fd = new FormData()
-        fd.append('file', await oscPairs[0].decay.handle.getFile())
-        const res = await fetch(apiUrl('/api/preview-osc'), { method: 'POST', body: fd })
-        const data = await res.json()
-        if (data.success) previewData = data
-      }
-      setFolderData({ dirHandle, vilFiles, oscPairs, unpairedOsc, existingTrel, previewData })
+
+      setFolderData({ rootPath, vilFiles, oscPairs, unpairedOsc, existingTrel, previewData: null })
       setFolderReady(true)
       if (oscPairs.length > 0) setTrelConfigOpen(true)
+      setScanningFolder(false)
+      await new Promise(resolve => setTimeout(resolve, 0))
+
+      if (oscPairs[0]?.decay?.relPath) {
+        const previewRes = await fetch(apiUrl('/api/preview-osc-path'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: rootPath, relPath: oscPairs[0].decay.relPath }),
+        })
+        const preview = await readJson(previewRes)
+        if (preview.success) {
+          setFolderData(prev => prev && prev.rootPath === rootPath ? { ...prev, previewData: preview } : prev)
+        }
+      }
     } catch (err) {
       setError(getReadableError(err))
-      setFolderReady(false)
+      if (!rootPath) setFolderReady(false)
     } finally {
       setSelectingFolder(false)
       setScanningFolder(false)
@@ -367,225 +367,39 @@ function App() {
   }
 
   const handleProcess = async () => {
-    if (!folderData) return
+    if (!folderData?.rootPath) return
     setError(null)
     setProcessing(true)
     const controller = new AbortController()
     batchAbortRef.current = controller
-    const { dirHandle, vilFiles, oscPairs, existingTrel } = folderData
     const signal = controller.signal
     try {
-      const hasWritePermission = await ensureReadWritePermission(dirHandle)
-      if (!hasWritePermission) {
-        throw new Error('폴더 쓰기 권한이 필요합니다. 권한 요청을 허용한 뒤 다시 시도해주세요.')
+      const res = await fetch(apiUrl('/api/process-batch'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          path: folderData.rootPath,
+          baseline_start_ns: baselineStart,
+          baseline_end_ns: baselineEnd,
+          norm_start_ns: normStart.trim(),
+          norm_end_ns: normEnd.trim(),
+          r_shunt: rShunt,
+          r_osc: rOsc,
+          device_area_mm2: deviceAreaMm2,
+          master_percents: masterPercents.replace(/\s/g, ''),
+        }),
+        signal,
+      })
+      const data = await readJson(res)
+      if (data.vil || data.osc || data.master) {
+        setResults({
+          vil: data.vil || [],
+          osc: data.osc || [],
+          master: !!data.master,
+          masterMetadata: data.masterMetadata || null,
+        })
       }
-
-      let vilResults = []
-      if (vilFiles.length > 0) {
-        const fd = new FormData()
-        for (const { handle, relPath } of vilFiles) {
-          fd.append('files', await handle.getFile())
-          fd.append('paths', relPath)
-        }
-        fd.append('r_shunt', rShunt)
-        fd.append('r_osc', rOsc)
-        fd.append('device_area_mm2', deviceAreaMm2)
-        const res = await fetch(apiUrl('/api/process-vil'), { method: 'POST', body: fd, signal })
-        const data = await res.json()
-        if (!data.success) throw new Error(data.error || 'VIL 처리 실패')
-        vilResults = data.results || []
-        const vilOutDir = await dirHandle.getDirectoryHandle('TrEL_processed', { create: true })
-        for (const r of vilResults) {
-          if (r.success && (r.xlsx_b64 || r.csv)) {
-            const pathParts = (r.relPath || r.filename).split('/').slice(0, -1)
-            let targetDir = vilOutDir
-            for (const p of pathParts) {
-              targetDir = await targetDir.getDirectoryHandle(p, { create: true })
-            }
-            const outName = r.output_filename || r.filename.replace('.csv', '_processed.xlsx')
-            const fh = await targetDir.getFileHandle(outName, { create: true })
-            const w = await fh.createWritable()
-            if (r.xlsx_b64) {
-              await w.write(base64ToUint8Array(r.xlsx_b64))
-            } else {
-              await w.write(r.csv)
-            }
-            await w.close()
-          }
-        }
-      }
-
-      let oscResults = []
-      if (oscPairs.length > 0) {
-        const outDir = await dirHandle.getDirectoryHandle('TrEL_processed', { create: true })
-        for (const { key, rise, decay } of oscPairs) {
-          const fd = new FormData()
-          fd.append('rise_file', await rise.handle.getFile())
-          fd.append('decay_file', await decay.handle.getFile())
-          fd.append('rise_path', rise.relPath)
-          fd.append('decay_path', decay.relPath)
-          fd.append('pair_key', key)
-          fd.append('baseline_start_ns', baselineStart)
-          fd.append('baseline_end_ns', baselineEnd)
-          fd.append('norm_start_ns', normStart.trim())
-          fd.append('norm_end_ns', normEnd.trim())
-          fd.append('r_shunt', rShunt)
-          fd.append('r_osc', rOsc)
-          fd.append('device_area_mm2', deviceAreaMm2)
-
-          const res = await fetch(apiUrl('/api/process-osc'), { method: 'POST', body: fd, signal })
-          const data = await res.json().catch(() => ({}))
-          if (!data.success) throw new Error(data.error || 'TrEL 처리 실패')
-
-          const fileResults = data.results || []
-          oscResults.push(...fileResults)
-
-          for (const r of fileResults) {
-            if (r.success && r.csv) {
-              const pathParts = (r.relPath || r.filename).split('/').slice(0, -1)
-              let targetDir = outDir
-              for (const p of pathParts) {
-                targetDir = await targetDir.getDirectoryHandle(p, { create: true })
-              }
-              const fh = await targetDir.getFileHandle(r.output_filename, { create: true })
-              const w = await fh.createWritable()
-              await w.write(r.csv)
-              await w.close()
-            }
-          }
-        }
-      }
-
-      let masterOk = false
-      let masterMetadata = null
-      const vilForMaster = vilResults.find(r => r.success && r.csv)
-      if (vilForMaster) {
-        const generatedTrelEntries = oscResults
-          .filter(r => r.success && r.csv)
-          .map(r => ({
-            name: r.output_filename,
-            filename: r.output_filename,
-            originalFilename: r.filename,
-            relPath: r.relPath || r.output_filename,
-            cacheKey: r.cache_key,
-            getFile: async () => new File([r.csv], r.output_filename),
-          }))
-
-        const existingTrelEntries = existingTrel.map(({ name, relPath, handle }) => ({
-          name,
-          filename: name,
-          relPath,
-          getFile: async () => handle.getFile(),
-        }))
-
-        const candidateTrelEntries = generatedTrelEntries.length > 0 ? generatedTrelEntries : existingTrelEntries
-
-        if (candidateTrelEntries.length === 0) {
-          const failedOsc = oscResults.filter(r => !r.success)
-          const firstOscError = failedOsc[0]?.error
-          if (generatedTrelEntries.length === 0 && oscResults.length > 0) {
-            throw new Error(
-              firstOscError
-                ? `TrEL 처리에 모두 실패했습니다. 첫 번째 오류: ${firstOscError}`
-                : 'TrEL 처리에 성공한 파일이 없습니다. TrEL_processed에 _TrEL.csv가 생성됐는지 확인해주세요.',
-            )
-          }
-          throw new Error('마스터 파일 생성에 사용할 TrEL 파일이 없습니다. TrEL 처리 결과 또는 기존 _TrEL.csv 파일을 확인해주세요.')
-        }
-
-        // 마스터 파일 생성 전 백엔드 연결 확인 및 재시도
-        let retryCount = 0
-        const maxRetries = 3
-        let lastError = null
-        
-        while (retryCount < maxRetries) {
-          try {
-            // 백엔드 연결 상태 확인
-            const healthCheck = await fetch(apiUrl('/api/health'), { signal, cache: 'no-cache' })
-            if (!healthCheck.ok) {
-              throw new Error(`백엔드 헬스체크 실패 (HTTP ${healthCheck.status})`)
-            }
-            
-            const fd = new FormData()
-            if (vilForMaster.cache_key) {
-              fd.append('vil_cache_key', vilForMaster.cache_key)
-            } else {
-              fd.append('vil_csv', vilForMaster.csv)
-              fd.append('vil_time_shift_min', String(vilForMaster.time_shift_min ?? 0))
-            }
-            if (vilForMaster.filename) {
-              fd.append('vil_filename', vilForMaster.filename)
-            }
-            fd.append('master_percents', masterPercents.replace(/\s/g, ''))
-            fd.append('r_shunt', rShunt)
-            fd.append('r_osc', rOsc)
-            fd.append('device_area_mm2', deviceAreaMm2)
-            for (const entry of candidateTrelEntries) {
-              if (entry.cacheKey) {
-                fd.append('cache_keys', entry.cacheKey)
-              } else {
-                fd.append('files', await entry.getFile())
-              }
-            }
-            
-            const res = await fetch(apiUrl('/api/create-master'), { 
-              method: 'POST', 
-              body: fd, 
-              signal
-            })
-            
-            if (!res.ok) {
-              // 413 에러 처리
-              if (res.status === 413) {
-                const data = await res.json().catch(() => ({}))
-                throw new Error(data.error || '요청 크기가 너무 큽니다. 전송하려는 파일이 너무 많거나 크기 때문일 수 있습니다.')
-              }
-              const data = await res.json().catch(() => ({}))
-              throw new Error(data.error || `HTTP ${res.status}: 백엔드 응답 오류`)
-            }
-            
-            const ct = res.headers.get('content-type') || ''
-            if (ct.includes('json')) {
-              const data = await res.json()
-              throw new Error(data.error || '마스터 생성 실패')
-            }
-            
-            const metaHeader = res.headers.get('X-Master-Metadata')
-            if (metaHeader) {
-              try { masterMetadata = JSON.parse(metaHeader) } catch (_) {}
-            }
-            const masterFilename = masterMetadata?.output_filename
-              || (() => {
-                const disposition = res.headers.get('content-disposition') || ''
-                const match = disposition.match(/filename="?([^"]+)"?/i)
-                return match?.[1] || 'TrEL_Master.xlsx'
-              })()
-            const blob = await res.blob()
-            const masterDir = await dirHandle.getDirectoryHandle('TrEL_processed', { create: true })
-            const fh = await masterDir.getFileHandle(masterFilename, { create: true })
-            const w = await fh.createWritable()
-            await w.write(blob)
-            await w.close()
-            masterOk = true
-            break // 성공하면 루프 종료
-          } catch (err) {
-            lastError = err
-            if (err.name === 'AbortError') {
-              throw err // 사용자가 중단한 경우 즉시 종료
-            }
-            retryCount++
-            if (retryCount < maxRetries) {
-              // 재시도 전 대기 (지수 백오프)
-              await new Promise(resolve => setTimeout(resolve, 1000 * retryCount))
-              continue
-            } else {
-              // 모든 재시도 실패
-              throw new Error(`마스터 파일 생성 실패 (${maxRetries}회 시도): ${getReadableError(err)}`)
-            }
-          }
-        }
-      }
-      setResults({ vil: vilResults, osc: oscResults, master: masterOk, masterMetadata })
+      if (!res.ok || !data.success) throw new Error(data.error || '처리 실패')
     } catch (err) {
       if (err.name === 'AbortError') {
         setError('사용자가 중단했습니다.')
@@ -597,6 +411,7 @@ function App() {
       batchAbortRef.current = null
     }
   }
+
 
   return (
     <div className="app">
@@ -648,6 +463,22 @@ function App() {
           >
             TrEL 배치 분석
           </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab('contour')}
+            style={{
+              padding: '10px 20px',
+              border: 'none',
+              background: activeTab === 'contour' ? '#fff' : 'transparent',
+              borderBottom: activeTab === 'contour' ? '2px solid #333' : '2px solid transparent',
+              cursor: 'pointer',
+              fontSize: '0.95em',
+              fontWeight: activeTab === 'contour' ? 600 : 400,
+              color: activeTab === 'contour' ? '#333' : '#666',
+            }}
+          >
+            Contour 정리
+          </button>
         </div>
 
         {activeTab === 'batch' && (
@@ -668,12 +499,23 @@ function App() {
             onClick={handleFolderSelect}
             disabled={processing || selectingFolder || scanningFolder || backendStatus?.status !== 'ok'}
           >
-            {selectingFolder ? '폴더 선택 창 여는 중...' : scanningFolder ? '폴더 스캔 중...' : '폴더 선택'}
+            {selectingFolder ? '탐색기에서 폴더를 선택하세요...' : scanningFolder ? '폴더 스캔 중...' : '폴더 선택'}
           </button>
+          {selectingFolder && (
+            <p style={{ marginTop: '12px', color: '#1565c0' }}>
+              폴더 선택 창이 다른 창 뒤에 있을 수 있습니다. 폴더를 고른 뒤 선택 버튼을 누르면 이 화면에 결과가 표시됩니다.
+            </p>
+          )}
 
           {folderReady && folderData && (
             <div style={{ marginTop: '20px', padding: '16px', background: '#fafafa', borderRadius: '6px', border: '1px solid #e0e0e0' }}>
               <h3 style={{ marginBottom: '12px', fontSize: '1.1em' }}>Low-frequency TrEL 처리 설정</h3>
+              <p style={{ marginBottom: '12px', wordBreak: 'break-all' }}>
+                <strong>{folderData.rootPath}</strong>
+                <span style={{ color: '#666' }}>
+                  {' '}· VIL {folderData.vilFiles?.length || 0}개 · 기존 TrEL {folderData.existingTrel?.length || 0}개
+                </span>
+              </p>
               {folderData.oscPairs?.length > 0 && (
                 <p style={{ fontSize: '0.85em', color: '#666', marginBottom: '12px' }}>
                   rise/decay 페어 {folderData.oscPairs.length}개 감지
@@ -899,6 +741,7 @@ function App() {
         )}
 
         {activeTab === 'analysis' && <AnalysisTab backendStatus={backendStatus} />}
+        {activeTab === 'contour' && <ContourTab backendStatus={backendStatus} />}
       </div>
     </div>
   )
